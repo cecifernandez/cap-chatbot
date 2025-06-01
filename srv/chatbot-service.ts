@@ -7,10 +7,10 @@ import { ChatbotRepository } from "./repository/ChatbotRepository";
 module.exports = cds.service.impl(async function () {
   const { ReclasificacionEntries } = cds.entities("sap.asientos");
 
-  const asientosRepository = new AsientosRepository();
+  // const asientosRepository = new AsientosRepository();
   const chatbotRepository = new ChatbotRepository();
 
-  await asientosRepository.init();
+  // await asientosRepository.init();
   await chatbotRepository.init();
 
   this.on("chat", async (req: any) => {
