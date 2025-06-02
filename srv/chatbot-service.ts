@@ -4,6 +4,11 @@ import "dotenv/config";
 import { AsientosRepository } from "./repository/AsientosRepository";
 import { ChatbotRepository } from "./repository/ChatbotRepository";
 
+function extractJsonFromText(text: string): string {
+  const match = text.match(/{[\s\S]*}/); // Encuentra el primer bloque entre llaves
+  return match ? match[0] : "{}";
+}
+
 module.exports = cds.service.impl(async function () {
   const { ReclasificacionEntries } = cds.entities("sap.asientos");
 
@@ -18,173 +23,108 @@ module.exports = cds.service.impl(async function () {
     const userId = req.data.userId || "anonymous_user";
     const apiKey = process.env.GEMINI_API_KEY;
 
-    if (!apiKey)
-      return req.reject(500, "❌ No se encontró la API KEY de Gemini.");
+    if (!apiKey) return req.reject(500, "Falta la API Key de Gemini.");
     if (!userMessage)
-      return req.reply({ error: "Por favor, envía un mensaje válido." });
+      return req.reply({ message: "Por favor, envíame un mensaje válido." });
 
     try {
-      let state = await chatbotRepository.getConversationState(userId);
-      let replyMessage = "";
-      let currentContextData = state.contextData;
-      const STEP = ChatbotRepository.CONVERSATION_STEPS;
+      // Prompt para interpretar el mensaje
+      const prompt = `
+Cuando el usuario te pida hacer una reclasificación o reclasificar, extrae los siguientes datos desde el mensaje del usuario si están presentes:
 
-      switch (state.currentStep) {
-        case STEP.INITIAL:
-        case STEP.ASKING_RECLASSIFICATION_COMMAND:
-          if (
-            ["reclasificación", "reclasificar", "reclasificacion"].some((k) =>
-              userMessage.toLowerCase().includes(k)
-            )
-          ) {
-            replyMessage =
-              "Perfecto, iniciemos una reclasificación. ¿Qué tipo de asiento es (gasto, ingreso, etc)?";
-            await chatbotRepository.saveConversationState(
-              userId,
-              STEP.RECLASSIFY_AWAITING_TYPE,
-              {}
-            );
-          } else {
-            replyMessage =
-              "Hola, soy tu asistente para asientos contables en SAP FI. Puedes pedirme que 'reclasifique' algo.";
-            await chatbotRepository.saveConversationState(
-              userId,
-              STEP.ASKING_RECLASSIFICATION_COMMAND,
-              {}
-            );
-          }
-          break;
+- intención = reclasificación, reclasificar, reclasificacion
+- tipo de asiento (gasto, ingreso, activo, pasivo)
+- cuenta original
+- centro de costo original
+- centro de costo destino
+- monto
+- descripción
 
-        case STEP.RECLASSIFY_AWAITING_TYPE:
-          currentContextData.type = userMessage;
-          replyMessage = `Entendido, un asiento de ${userMessage}. ¿Cuál es la cuenta contable original (ej. 400000)?;`;
-          await chatbotRepository.saveConversationState(
-            userId,
-            STEP.RECLASSIFY_AWAITING_ACCOUNT,
-            currentContextData
-          );
-          break;
+Mensaje: "${userMessage}"
 
-        case STEP.RECLASSIFY_AWAITING_ACCOUNT:
-          currentContextData.originalAccount = userMessage;
-          replyMessage = `Ok, cuenta ${userMessage}. ¿Cuál es el centro de costo (CeCo) original?;`;
-          await chatbotRepository.saveConversationState(
-            userId,
-            STEP.RECLASSIFY_AWAITING_ORIGINAL_CECO,
-            currentContextData
-          );
-          break;
-
-        case STEP.RECLASSIFY_AWAITING_ORIGINAL_CECO:
-          currentContextData.originalCeCo = userMessage;
-          replyMessage = `Recibido, CeCo original ${userMessage}. ¿Y cuál es el centro de costo (CeCo) destino?;`;
-          await chatbotRepository.saveConversationState(
-            userId,
-            STEP.RECLASSIFY_AWAITING_TARGET_CECO,
-            currentContextData
-          );
-          break;
-
-        case STEP.RECLASSIFY_AWAITING_TARGET_CECO:
-          currentContextData.targetCeCo = userMessage;
-          replyMessage = `Ok, CeCo destino ${userMessage}. ¿Cuál es el monto de la reclasificación? (ej. 1234.50);`;
-          await chatbotRepository.saveConversationState(
-            userId,
-            STEP.RECLASSIFY_AWAITING_AMOUNT,
-            currentContextData
-          );
-          break;
-
-        case STEP.RECLASSIFY_AWAITING_AMOUNT:
-          const amount = parseFloat(userMessage.replace(",", "."));
-          if (isNaN(amount) || amount <= 0) {
-            replyMessage =
-              "El monto no es válido. Ingresá un número mayor a cero (ej. 1234.50)";
-            await chatbotRepository.saveConversationState(
-              userId,
-              STEP.RECLASSIFY_AWAITING_AMOUNT,
-              currentContextData
-            );
-          } else {
-            currentContextData.amount = amount;
-            replyMessage = `Monto ${amount} recibido. Finalmente, ¿cuál es la descripción o concepto de esta reclasificación?;`;
-            await chatbotRepository.saveConversationState(
-              userId,
-              STEP.RECLASSIFY_AWAITING_DESCRIPTION,
-              currentContextData
-            );
-          }
-          break;
-
-        case STEP.RECLASSIFY_AWAITING_DESCRIPTION:
-          currentContextData.description = userMessage;
-
-          const prompt = `
-Genera una sugerencia de asiento contable para una reclasificación en SAP FI con los siguientes detalles:
-- Tipo de Asiento: ${currentContextData.type}
-- Cuenta Original: ${currentContextData.originalAccount}
-- CeCo Original: ${currentContextData.originalCeCo}
-- CeCo Destino: ${currentContextData.targetCeCo}
-- Monto: ${currentContextData.amount}
-- Descripción: ${currentContextData.description}
-
-Incluye las cuentas de Debe y Haber, los montos y los centros de costo involucrados.
-Sin introducciones ni conclusiones.
+Devolvé el resultado en formato JSON plano. Si algo falta, ponelo como null.
 `;
 
-          const geminiResponse = await axios.post(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-            {
-              contents: [{ role: "user", parts: [{ text: prompt }] }],
-            },
-            { headers: { "Content-Type": "application/json" } }
-          );
+      const geminiResponse = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+        {
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+        },
+        { headers: { "Content-Type": "application/json" } }
+      );
 
-          const suggestion =
-            geminiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-            "Sin sugerencia generada.";
-          currentContextData.geminiSuggestion = suggestion;
+      const extractedText =
+        geminiResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      console.log("📨 Respuesta bruta de Gemini:", extractedText);
 
-          if (!ReclasificacionEntries) {
-            throw new Error("Entidad ReclasificacionEntries no encontrada.");
-          }
-
-          await cds.run(
-            INSERT.into(ReclasificacionEntries).entries({
-              originalAccount: currentContextData.originalAccount || "",
-              originalCeCo: currentContextData.originalCeCo || "",
-              targetCeCo: currentContextData.targetCeCo || "",
-              amount: currentContextData.amount || 0,
-              description: currentContextData.description || "",
-              geminiSuggestion: currentContextData.geminiSuggestion || "",
-              status: "COMPLETED",
-            })
-          );
-
-          await chatbotRepository.clearConversationState(userId);
-          replyMessage = `¡Listo! Registré tu reclasificación. Sugerencia:\n\n${suggestion}\n\n¿Necesitás algo más?`;
-          break;
-
-        default:
-          replyMessage =
-            "No entendí en qué estábamos. Reiniciemos. ¿Querés hacer una reclasificación?";
-          await chatbotRepository.clearConversationState(userId);
-          break;
+      let parsed: any = {};
+      try {
+        const cleanJson = extractJsonFromText(extractedText);
+        parsed = JSON.parse(cleanJson);
+      } catch (e) {
+        console.error("❌ Error al parsear JSON desde Gemini:", extractedText);
+        return req.reject(
+          500,
+          "La IA no devolvió una respuesta válida. Intentá de nuevo."
+        );
       }
 
-      req.reply({ message: replyMessage });
+      const {
+        intencion,
+        tipo,
+        cuentaOriginal,
+        cecoOriginal,
+        cecoDestino,
+        monto,
+        descripcion,
+      } = parsed;
+
+      if (!intencion || !intencion.toLowerCase().includes("reclasificacion")) {
+        return req.reply({
+          message:
+            "Por ahora solo puedo ayudarte con reclasificaciones. ¿Querés hacer una?",
+        });
+      }
+
+      const missing = [];
+      if (!tipo) missing.push("tipo de asiento");
+      if (!cuentaOriginal) missing.push("cuenta original");
+      if (!cecoOriginal) missing.push("CeCo original");
+      if (!cecoDestino) missing.push("CeCo destino");
+      if (!monto) missing.push("monto");
+      if (!descripcion) missing.push("descripción");
+
+      if (missing.length > 0) {
+        return req.reply({
+          message: `Me faltan los siguientes datos para continuar: ${missing.join(
+            ", "
+          )}. Por favor completalos.`,
+        });
+      }
+
+      // Todos los datos están presentes -> guardamos
+      await cds.run(
+        INSERT.into("sap.asientos.ReclasificacionEntries").entries({
+          originalAccount: cuentaOriginal,
+          originalCeCo: cecoOriginal,
+          targetCeCo: cecoDestino,
+          amount: parseFloat(monto),
+          description: descripcion,
+          status: "COMPLETED",
+        })
+      );
+
+      return req.reply({
+        message: `Registré la reclasificación correctamente. ¿Querés que te muestre cómo quedaría el asiento contable?`,
+      });
     } catch (error: any) {
       console.error("❌ ERROR:", error.message);
       console.error("🔍 Detalle:", error.response?.data || error);
-      await chatbotRepository.clearConversationState(userId);
 
-      let msg = "Fallo interno del chatbot. Reintentá más tarde.";
-      if (
-        error?.response?.data?.error?.message?.includes("API key not valid")
-      ) {
-        msg = "API Key de Gemini inválida o vencida.";
-      }
-      req.reject(500, msg);
+      return req.reject(
+        500,
+        "Ocurrió un error procesando tu mensaje. Reintentá o contactá a soporte."
+      );
     }
   });
 });
